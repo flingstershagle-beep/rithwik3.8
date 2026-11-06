@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/provider.js": { "maxDuration": 60 },
+    "api/file.js": { "maxDuration": 60 },
+    "api/proxy.js": { "maxDuration": 60 },
+    "api/download.js": { "maxDuration": 60 }
+  }
+}
