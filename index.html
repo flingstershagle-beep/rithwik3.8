@@ -760,19 +760,41 @@
       clearTimeout(timer);
     }
   }
+  function cleanDownloadFilename(value){
+    const cleaned = String(value || 'rkefx-download')
+      .replace(/[\\/:*?"<>|\r\n]+/g, '-')
+      .replace(/\.+$/g, '')
+      .slice(0, 120);
+    return cleaned || 'rkefx-download';
+  }
+
   async function triggerDownload(url, filename){
     if (!isDownloadUrl(url)) throw new Error('The API did not return a valid download link.');
-    // The download endpoint is same-origin and streams the file with an attachment
-    // header. This avoids cross-origin download restrictions on Windows, macOS,
-    // Linux, Android and iOS browsers.
-    const target = url.startsWith('/api/file?') ? url : ('/api/download?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename || 'rkefx-download'));
-    const a = document.createElement('a');
-    a.href = target;
-    a.download = filename || 'rkefx-download';
-    a.rel = 'noopener';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+
+    const finalName = cleanDownloadFilename(filename);
+    let target;
+
+    if (url.startsWith('/api/file?')) {
+      // This is already a same-origin file endpoint. It MUST return
+      // Content-Disposition: attachment; filename="..." from the server.
+      const fileUrl = new URL(url, window.location.origin);
+      fileUrl.searchParams.set('filename', finalName);
+      target = fileUrl.pathname + fileUrl.search;
+    } else {
+      // External media URLs must pass through the same-origin download proxy.
+      // The proxy must respond with Content-Disposition: attachment.
+      target = '/api/download?url=' + encodeURIComponent(url) +
+        '&filename=' + encodeURIComponent(finalName);
+    }
+
+    const link = document.createElement('a');
+    link.href = target;
+    link.download = finalName;
+    link.style.display = 'none';
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
     return 'download';
   }
   function fmtNum(n){
@@ -977,37 +999,104 @@
       return await Promise.any(urls.map(u => fetchJSON(u, 5000).then(d => (d && d.title) ? d : Promise.reject(new Error('no title')))));
     } catch(e){ return null; }
   }
+  function findYtMediaUrl(data, depth){
+    depth = depth || 0;
+    if (!data || depth > 8) return '';
+    if (typeof data === 'string') return isHttp(data) ? data : '';
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        const found = findYtMediaUrl(item, depth + 1);
+        if (found) return found;
+      }
+      return '';
+    }
+    if (typeof data !== 'object') return '';
+    const keys = ['download_url','downloadUrl','direct_url','directUrl','url','link','video_url','videoUrl','audio_url','audioUrl','mp4','mp3','src'];
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === 'string' && isHttp(value)) return value;
+    }
+    for (const value of Object.values(data)) {
+      if (value && typeof value === 'object') {
+        const found = findYtMediaUrl(value, depth + 1);
+        if (found) return found;
+      }
+    }
+    return '';
+  }
+
   async function ytInfo(query){
     const id = extractYtId(query);
     if (!id) throw new Error('Please paste a valid YouTube video link.');
     const url = 'https://www.youtube.com/watch?v=' + id;
-    const data = await fetchJSON('/api/provider?platform=youtube&url=' + encodeURIComponent(url), 60000);
-    if (!apiSucceeded(data) || !Array.isArray(data.media))
-      throw new Error(apiError(data, 'YouTube could not prepare this video.'));
-    const videos = data.media.filter(x => x.type === 'video' && isDownloadUrl(x.url) && (!x.ext || String(x.ext).toLowerCase() === 'mp4'));
-    const audios = data.media.filter(x => x.type === 'audio' && isDownloadUrl(x.url));
-    if (!videos.length && !audios.length) throw new Error('The provider returned no downloadable formats for this video.');
-    return {
-      platform:'youtube', title:data.title || 'YouTube Video',
-      thumbnail:data.thumbnail || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'),
-      duration:data.duration_sec || '', channel:data.author || '', views:'', url,
-      mp3_direct: audios[0] ? audios[0].url : '',
-      audioUrl: audios[0] ? audios[0].url : '',
-      audioExt: audios[0] && audios[0].ext ? String(audios[0].ext).toLowerCase() : 'm4a',
-      formats: videos.map(x => ({height:Number(x.height)||0, quality:x.quality||'', url:x.url, format_id:x.format_id||''}))
-    };
+    let lastError = null;
+
+    // First try RK MEDIA's same-origin provider route.
+    try {
+      const data = await fetchJSON('/api/provider?platform=youtube&url=' + encodeURIComponent(url), 60000);
+      if (apiSucceeded(data) && Array.isArray(data.media)) {
+        const videos = data.media.filter(x => x.type === 'video' && isDownloadUrl(x.url) && (!x.ext || String(x.ext).toLowerCase() === 'mp4'));
+        const audios = data.media.filter(x => x.type === 'audio' && isDownloadUrl(x.url));
+        if (videos.length || audios.length) {
+          return {
+            platform:'youtube', title:data.title || 'YouTube Video',
+            thumbnail:data.thumbnail || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'),
+            duration:data.duration_sec || '', channel:data.author || '', views:'', url,
+            mp3_direct: audios[0] ? audios[0].url : '',
+            audioUrl: audios[0] ? audios[0].url : '',
+            audioExt: audios[0] && audios[0].ext ? String(audios[0].ext).toLowerCase() : 'm4a',
+            formats: videos.map(x => ({height:Number(x.height)||0, quality:x.quality||'', url:x.url, format_id:x.format_id||''}))
+          };
+        }
+      }
+      lastError = new Error(apiError(data, 'YouTube provider returned no usable formats.'));
+    } catch (e) { lastError = e; }
+
+    // Fallback to the YouTube play APIs already configured in this page.
+    for (const endpoint of [API.ytPlayB, API.ytPlayA]) {
+      try {
+        const data = await fetchJSON(endpoint + encodeURIComponent(url), 30000);
+        const result = data && (data.result || data.data || data);
+        if (!apiSucceeded(data) || !result || typeof result !== 'object') continue;
+        const normalized = endpoint === API.ytPlayB ? normalizeNexray(result) : normalizeKirax(result);
+        const title = normalized.title || 'YouTube Video';
+        return {
+          ...normalized, platform:'youtube', title, url,
+          thumbnail: normalized.thumbnail || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'),
+          mp3_direct: normalized.mp3_direct || '',
+          audioUrl: normalized.mp3_direct || '',
+          audioExt: 'mp3',
+          formats: []
+        };
+      } catch (e) { lastError = e; }
+    }
+    throw new Error((lastError && lastError.message) || 'YouTube could not prepare this video. Please try again later.');
   }
+
   async function ytGetMp3(url, fallback){
     if (state.currentMedia && state.currentMedia.audioUrl) return state.currentMedia.audioUrl;
     if (fallback && isHttp(fallback)) return fallback;
-    throw new Error('YouTube audio is not available for this video.');
+    const data = await fetchJSON(API.ytMp3 + encodeURIComponent(url), 60000);
+    if (!apiSucceeded(data)) throw new Error(apiError(data, 'YouTube MP3 conversion failed.'));
+    const mediaUrl = findYtMediaUrl(data);
+    if (!mediaUrl) throw new Error('The MP3 service returned no downloadable file URL.');
+    return mediaUrl;
   }
+
   async function ytGetMp4(url, res){
     const formats = state.currentMedia && state.currentMedia.formats || [];
     const eligible = formats.filter(x => x.height && x.height <= res).sort((a,b) => b.height-a.height);
     const selected = eligible[0] || formats.slice().sort((a,b) => b.height-a.height)[0];
-    if (!selected) throw new Error('No MP4 format is available for this video.');
-    return {url:selected.url, res:selected.height || res, fellBack:(selected.height || res) !== res};
+    if (selected) return {url:selected.url, res:selected.height || res, fellBack:(selected.height || res) !== res};
+
+    // If the provider supplied metadata but no format list, request a conversion URL.
+    const data = await fetchJSON(API.ytMp4 + encodeURIComponent(url), 90000);
+    if (!apiSucceeded(data)) throw new Error(apiError(data, 'YouTube MP4 conversion failed.'));
+    const mediaUrl = findYtMediaUrl(data);
+    if (!mediaUrl) throw new Error('The MP4 service returned no downloadable file URL.');
+    const reported = Number(data.height || data.resolution || data.quality || res);
+    const actualRes = Number.isFinite(reported) && reported > 0 ? reported : res;
+    return {url:mediaUrl, res:actualRes, fellBack:actualRes !== res};
   }
 
   function renderSearchList(items, query){
@@ -1167,7 +1256,11 @@
     resultsEl.innerHTML = resultsHead('Facebook · Ready to Download') + `
       <div class="result-card">
         <div class="thumb">
-          <div class="fb-preview"><video src="${esc(r.videoPreview)}" controls preload="metadata" playsinline></video></div>
+          <div class="fb-preview" aria-label="Facebook video ready to download">
+            <div style="padding:20px;text-align:center;color:#a9a8cc;font-size:.9rem">
+              Video ready — choose a download quality
+            </div>
+          </div>
         </div>
         <div class="result-body">
           <div class="result-title">${esc(r.title)}</div>
